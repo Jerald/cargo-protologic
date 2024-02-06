@@ -5,7 +5,9 @@ use std::process::{Child, Command};
 use std::time::SystemTime;
 
 use anyhow::Context;
+use bytesize::ByteSize;
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use wasm_opt::OptimizationOptions;
 
 /// You shouldn't see this! Run this tool like `cargo protologic`.
@@ -19,20 +21,20 @@ struct CargoProtologic {
 
 #[derive(clap::Subcommand, Debug, Clone)]
 enum ProtologicCommand {
-    /// A helper for create Protologic fleets in rust!
+    /// A helper for creating Protologic fleets in rust!
     #[command(subcommand)]
     Protologic(Commands),
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
 enum Commands {
-    /// Builds Protologic fleets in the cargo workspace.
+    /// Builds Protologic fleets from the cargo workspace.
     ///
-    /// By default will build all packages in the workspace as fleets. You may pass a package name explicitly if you'd like.
+    /// With no argument, it will build the default members of the workspace. You may pass a package name explicitly instead.
     Build {
-        /// Package to build
+        /// Package to build. May be repeated multiple times!
         #[arg(short, long)]
-        package: Option<String>,
+        package: Option<Vec<String>>,
     },
 
     /// List all built fleets. If you see none, try building them!
@@ -43,7 +45,7 @@ enum Commands {
     /// Optionally can open the replay in the player.
     Run {
         /// The location of the Protologic/Release repo. Can specify as an environment variable for ease of use!
-        #[arg(short, long, env)]
+        #[arg(long, env)]
         protologic_path: PathBuf,
         /// Whether to set the `--debug` flag in Protologic.
         #[arg(short, long, default_value = "false")]
@@ -62,27 +64,40 @@ fn main() -> anyhow::Result<()> {
 
     match command {
         Commands::Build { package } => {
-            build(package)?
-                .wait()
-                .context("trying to wait until the `cargo build` execution has finished")?;
+            println!("Building packages...");
+            for package in package.map_or_else(list_workspace_fleets, Result::Ok)? {
+                build(package)?
+                    .wait()
+                    .context("trying to wait until the `cargo build` execution has finished")?;
+            }
 
             let is_wasm_output = |entry: &DirEntry| {
-                PathBuf::from(entry.file_name())
+                entry
+                    .path()
                     .extension()
                     .and_then(|ext| Some(ext.to_str()? == "wasm"))
                     .unwrap_or(false)
             };
 
-            let wasm_output = std::fs::read_dir(cargo_output_base_path())
+            let wasm_output = std::fs::read_dir(cargo_output_base_path()?)
                 .context("Can't find wasm output from build")?
-                .filter(|entry| entry.as_ref().is_ok_and(is_wasm_output));
+                .filter(|entry| entry.as_ref().is_ok_and(is_wasm_output))
+                .collect::<Vec<_>>();
 
-            for entry in wasm_output {
-                optimize_wasm(entry?.path())?;
+            if wasm_output.is_empty() {
+                println!("No wasm output found. Your build didn't produce any .wasm files!");
+            } else {
+                println!("Optimizing wasm outputs...");
+                for entry in wasm_output {
+                    optimize_wasm(entry?.path())?;
+                }
+                println!("Done optimizing!");
             }
         }
         Commands::List {} => {
-            for entry in find_fleets()? {
+            println!("Listing built fleets...");
+
+            for entry in find_built_fleets()? {
                 println!("Found fleet: {entry:?}");
             }
         }
@@ -91,7 +106,7 @@ fn main() -> anyhow::Result<()> {
             debug,
             player,
         } => {
-            let fleets = find_fleets()?;
+            let fleets = find_built_fleets()?;
             let [fleet1, fleet2] = fleets
                 .first_chunk()
                 .context("tried to get find fleets 1 and 2")?;
@@ -134,56 +149,104 @@ fn main() -> anyhow::Result<()> {
 
 const WASI_TARGET: &str = "wasm32-wasi";
 
-fn find_fleets() -> anyhow::Result<Vec<DirEntry>> {
+#[derive(Serialize, Deserialize, Debug)]
+struct ParsedMetadata {
+    workspace_default_members: Vec<String>,
+    target_directory: PathBuf,
+}
+
+fn cargo_metadata() -> anyhow::Result<ParsedMetadata> {
+    let mut cargo = std::process::Command::new("cargo");
+    cargo.arg("metadata").args(["--format-version", "1"]);
+
+    let output = cargo
+        .output()
+        .context("trying to run `cargo metadata` to find workspace members")?;
+
+    serde_json::from_slice(&output.stdout).context("trying to parse `cargo metadata` output")
+}
+
+/// Lists the fleets in the workspace.
+///
+/// Currently it provides all `default-members` of the cargo workspace. The intended workflow is
+/// to make non-fleet packages (i.e. helpers) non-default members.
+fn list_workspace_fleets() -> anyhow::Result<Vec<String>> {
+    let metadata = cargo_metadata()?;
+    println!("Metadata: {metadata:?}");
+
+    Ok(metadata.workspace_default_members)
+}
+
+fn find_built_fleets() -> anyhow::Result<Vec<DirEntry>> {
     std::fs::read_dir(fleet_output_base_path()?)
         .context("trying to list fleet output directory")?
         .collect::<io::Result<Vec<DirEntry>>>()
         .context("trying to collect fleets in output directory")
 }
 
-fn build(package: Option<String>) -> anyhow::Result<Child> {
+fn build(package: String) -> anyhow::Result<Child> {
     let mut cargo = Command::new("cargo");
-    cargo.arg("build");
-
-    if let Some(package) = package {
-        cargo.arg("-p").arg(package);
-    } else {
-        cargo.arg("--workspace");
-    }
-
-    cargo.args(["--target", WASI_TARGET]);
-    cargo.arg("--release");
+    cargo
+        // Using `rustc` instead of `build` so we can pass `--crate-type`
+        .arg("rustc")
+        .args(["-p", &package])
+        // This is needed for rustc to produce a .wasm artifact
+        .args(["--crate-type", "cdylib"])
+        .args(["--target", WASI_TARGET])
+        .arg("--release");
 
     cargo.spawn().context("trying to build packages with cargo")
 }
 
-fn optimize_wasm(input_file: impl AsRef<Path>) -> anyhow::Result<()> {
-    let opt_options = make_wasm_opt();
+fn optimize_wasm(input_path: impl AsRef<Path>) -> anyhow::Result<()> {
+    fn size_from_fs(path: impl AsRef<Path>) -> anyhow::Result<u64> {
+        std::fs::metadata(path)
+            .context("trying to access path to query size")
+            .map(|m| m.len())
+    }
 
-    let wasm_file_name = input_file
+    let input_size = size_from_fs(&input_path)?;
+
+    let wasm_file_name = input_path
         .as_ref()
         .file_name()
         .and_then(|name| name.to_str())
         .expect("Input path must be a wasm file!");
-    let output_file = wasm_opt_output_path(wasm_file_name)?;
-    opt_options
-        .run(input_file, output_file)
-        .context("Error optimizing wasm binary")
+
+    let output_path = wasm_opt_output_path(wasm_file_name)?;
+    make_wasm_opt()
+        .run(&input_path, &output_path)
+        .context("Error optimizing wasm binary")?;
+
+    let output_size = size_from_fs(&output_path)?;
+
+    let fleet_name = extract_fleet_name(&input_path)?;
+    println!(
+        "[Optimizing wasm] Fleet '{fleet_name}' optimized {} -> {}",
+        ByteSize::b(input_size),
+        ByteSize::b(output_size)
+    );
+
+    Ok(())
 }
 
-fn cargo_output_base_path() -> String {
-    format!("./target/{WASI_TARGET}/release/")
+fn cargo_output_base_path() -> anyhow::Result<PathBuf> {
+    let metadata = cargo_metadata()?;
+    Ok(metadata
+        .target_directory
+        .join(format!("./{WASI_TARGET}/release/")))
 }
 
 fn wasm_opt_output_path(input_file_name: impl AsRef<str>) -> anyhow::Result<PathBuf> {
-    Ok(fleet_output_base_path()?.join(format!("fleet_{}", input_file_name.as_ref())))
+    Ok(fleet_output_base_path()?.join(input_file_name.as_ref()))
 }
 
 fn fleet_output_base_path() -> anyhow::Result<PathBuf> {
     let path = PathBuf::from("./target/protologic_fleets/");
 
     if !path.exists() {
-        std::fs::create_dir(&path).context("trying to create fleet output path")?;
+        std::fs::create_dir(&path)
+            .with_context(|| format!("trying to create fleet output path: {path:?}",))?;
     }
 
     Ok(path)
@@ -230,20 +293,17 @@ fn make_wasm_opt() -> OptimizationOptions {
     opt_options
 }
 
-fn extract_fleet_name(fleet_path: PathBuf) -> anyhow::Result<String> {
-    let fleet_file_name = fleet_path
+/// Takes the path to a fleet, extracting out the name of the fleet the correct way
+fn extract_fleet_name(fleet_path: impl AsRef<Path>) -> anyhow::Result<String> {
+    fleet_path
+        .as_ref()
+        // drop the `.wasm`
         .with_extension("")
         .file_name()
         .context("fleet name wouldn't be found in fleet path. Try again?")?
         .to_str()
-        .context("you need to name your fleet valid unicode!")?
-        .to_owned();
-
-    let (_, fleet_name) = fleet_file_name
-        .split_once('_')
-        .context("trying to split fleet file by underscore")?;
-
-    Ok(fleet_name.to_string())
+        .context("you need to name your fleet valid unicode!")
+        .map(ToOwned::to_owned)
 }
 
 fn battle_output_path(fleet1: &DirEntry, fleet2: &DirEntry) -> anyhow::Result<PathBuf> {
@@ -254,4 +314,24 @@ fn battle_output_path(fleet1: &DirEntry, fleet2: &DirEntry) -> anyhow::Result<Pa
     let fleet2_name = extract_fleet_name(fleet2.path())?;
 
     Ok(std::env::current_dir()?.join(format!("{now}_{fleet1_name}_{fleet2_name}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::extract_fleet_name;
+
+    #[test]
+    fn extract_fleet_name_is_sane() -> anyhow::Result<()> {
+        let path = PathBuf::from("fleet_demo_fleet_foo_bar.wasm");
+        let name = extract_fleet_name(path)?;
+        assert_eq!("fleet_demo_fleet_foo_bar", name);
+
+        let path = PathBuf::from("demo_fleet_foo_bar");
+        let name = extract_fleet_name(path)?;
+        assert_eq!("demo_fleet_foo_bar", name);
+
+        Ok(())
+    }
 }
