@@ -37,7 +37,7 @@ enum Commands {
         package: Option<Vec<String>>,
         /// Enables debug build and removes wasm_opt optimizations. Makes things very slow!
         #[arg(short, long, default_value = "false")]
-        debug: bool
+        debug: bool,
     },
 
     /// List all built fleets. If you see none, try building them!
@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
     println!("{command:?}");
 
     match command {
-        Commands::Build { package , debug } => {
+        Commands::Build { package, debug } => {
             println!("Building packages...");
             for package in package.map_or_else(list_workspace_fleets, Result::Ok)? {
                 build(package, debug)?
@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
                 println!("Starting the protologic player! The command will exit now.");
 
                 let mut command =
-                    std::process::Command::new(protologic_player_path(&protologic_path));
+                    std::process::Command::new(protologic_player_path(&protologic_path)?);
                 command.arg(battle_output.with_extension("json.deflate"));
                 println!("Command to open player: {:?}", command);
 
@@ -197,7 +197,7 @@ fn build(package: String, debug: bool) -> anyhow::Result<Child> {
         .args(["--crate-type", "cdylib"])
         .args(["--target", WASI_TARGET]);
 
-    if !debug { 
+    if !debug {
         cargo.arg("--release");
     }
 
@@ -273,15 +273,21 @@ fn protologic_sim_path(protologic_path: &Path) -> PathBuf {
     }
 }
 
-fn protologic_player_path(protologic_path: &Path) -> PathBuf {
+fn protologic_player_path(protologic_path: &Path) -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        protologic_path.join("Player/Windows/PROTOLOGIC.exe")
+        Ok(protologic_path.join("Player/Windows/PROTOLOGIC.exe"))
     }
 
     #[cfg(target_os = "linux")]
     {
-        compile_error!("Protologic player doesn't support Linux! Go bug Martin to support this :)")
+        // Although this doesn't currently exist, it's a reasonably guess of what the path will be
+        let path = protologic_path.join("Player/Linux/PROTOLOGIC");
+        if !path.exists() {
+            anyhow::bail!("Can't find Protologic player for Linux! No such player exists as of 2024-02-08, so that may be why. Go bug Martin :)")
+        }
+
+        Ok(path)
     }
 }
 
@@ -299,8 +305,8 @@ fn make_wasm_opt(debug: bool) -> OptimizationOptions {
     }
 
     opt_options
-            .enable_feature(wasm_opt::Feature::BulkMemory)
-            .enable_feature(wasm_opt::Feature::Simd);
+        .enable_feature(wasm_opt::Feature::BulkMemory)
+        .enable_feature(wasm_opt::Feature::Simd);
 
     opt_options
         .add_pass(wasm_opt::Pass::Asyncify)

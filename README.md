@@ -27,3 +27,8 @@ Options:
 - Automatically builds a crate the right way to be used by Protologic. No `cdylib` required!
     - Note, you still should configure the release profile as you desire for optimizations
 - `build` subcommand uses cargo workspace `default-members` to pick fleets (by default). This enables you to have other helper crates in the workspace without them being confused for fleets!
+
+#### Optional
+
+- Can pass `--player` to `cargo protologic run` to start the replay in the player!
+    - Only works on Windows currently, as there's only a Windows build of protologic currently

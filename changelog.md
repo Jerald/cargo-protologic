@@ -1,6 +1,9 @@
 # Changelog
 ## 0.X.0
 
+## 0.2.2
+- No longer issue a compiler error when built on linux. Now returns an error if you try to run the player on Linux and it doesn't exist.
+
 ## 0.2.1
 - Support `--debug` in `cargo protologic build`. This uses debug build for rust and removes most `wasm_opt` optimizations, but makes things slow.
 
