@@ -35,6 +35,9 @@ enum Commands {
         /// Package to build. May be repeated multiple times!
         #[arg(short, long)]
         package: Option<Vec<String>>,
+        /// Enables debug build and removes wasm_opt optimizations. Makes things very slow!
+        #[arg(short, long, default_value = "false")]
+        debug: bool
     },
 
     /// List all built fleets. If you see none, try building them!
@@ -63,10 +66,10 @@ fn main() -> anyhow::Result<()> {
     println!("{command:?}");
 
     match command {
-        Commands::Build { package } => {
+        Commands::Build { package , debug } => {
             println!("Building packages...");
             for package in package.map_or_else(list_workspace_fleets, Result::Ok)? {
-                build(package)?
+                build(package, debug)?
                     .wait()
                     .context("trying to wait until the `cargo build` execution has finished")?;
             }
@@ -79,7 +82,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(false)
             };
 
-            let wasm_output = std::fs::read_dir(cargo_output_base_path()?)
+            let wasm_output = std::fs::read_dir(cargo_output_base_path(debug)?)
                 .context("Can't find wasm output from build")?
                 .filter(|entry| entry.as_ref().is_ok_and(is_wasm_output))
                 .collect::<Vec<_>>();
@@ -89,7 +92,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 println!("Optimizing wasm outputs...");
                 for entry in wasm_output {
-                    optimize_wasm(entry?.path())?;
+                    optimize_wasm(entry?.path(), debug)?;
                 }
                 println!("Done optimizing!");
             }
@@ -184,7 +187,7 @@ fn find_built_fleets() -> anyhow::Result<Vec<DirEntry>> {
         .context("trying to collect fleets in output directory")
 }
 
-fn build(package: String) -> anyhow::Result<Child> {
+fn build(package: String, debug: bool) -> anyhow::Result<Child> {
     let mut cargo = Command::new("cargo");
     cargo
         // Using `rustc` instead of `build` so we can pass `--crate-type`
@@ -192,13 +195,16 @@ fn build(package: String) -> anyhow::Result<Child> {
         .args(["-p", &package])
         // This is needed for rustc to produce a .wasm artifact
         .args(["--crate-type", "cdylib"])
-        .args(["--target", WASI_TARGET])
-        .arg("--release");
+        .args(["--target", WASI_TARGET]);
+
+    if !debug { 
+        cargo.arg("--release");
+    }
 
     cargo.spawn().context("trying to build packages with cargo")
 }
 
-fn optimize_wasm(input_path: impl AsRef<Path>) -> anyhow::Result<()> {
+fn optimize_wasm(input_path: impl AsRef<Path>, debug: bool) -> anyhow::Result<()> {
     fn size_from_fs(path: impl AsRef<Path>) -> anyhow::Result<u64> {
         std::fs::metadata(path)
             .context("trying to access path to query size")
@@ -214,7 +220,7 @@ fn optimize_wasm(input_path: impl AsRef<Path>) -> anyhow::Result<()> {
         .expect("Input path must be a wasm file!");
 
     let output_path = wasm_opt_output_path(wasm_file_name)?;
-    make_wasm_opt()
+    make_wasm_opt(debug)
         .run(&input_path, &output_path)
         .context("Error optimizing wasm binary")?;
 
@@ -230,11 +236,12 @@ fn optimize_wasm(input_path: impl AsRef<Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cargo_output_base_path() -> anyhow::Result<PathBuf> {
+fn cargo_output_base_path(debug: bool) -> anyhow::Result<PathBuf> {
     let metadata = cargo_metadata()?;
+    let profile = if debug { "debug" } else { "release" };
     Ok(metadata
         .target_directory
-        .join(format!("./{WASI_TARGET}/release/")))
+        .join(format!("./{WASI_TARGET}/{profile}/")))
 }
 
 fn wasm_opt_output_path(input_file_name: impl AsRef<str>) -> anyhow::Result<PathBuf> {
@@ -278,17 +285,26 @@ fn protologic_player_path(protologic_path: &Path) -> PathBuf {
     }
 }
 
-fn make_wasm_opt() -> OptimizationOptions {
-    let mut opt_options = wasm_opt::OptimizationOptions::new_opt_level_4();
+fn make_wasm_opt(debug: bool) -> OptimizationOptions {
+    let mut opt_options = if debug {
+        wasm_opt::OptimizationOptions::new_opt_level_0()
+    } else {
+        wasm_opt::OptimizationOptions::new_opt_level_4()
+    };
+
+    if debug {
+        opt_options.debug_info(true);
+    } else {
+        opt_options.add_pass(wasm_opt::Pass::StripDwarf);
+    }
 
     opt_options
-        .enable_feature(wasm_opt::Feature::BulkMemory)
-        .enable_feature(wasm_opt::Feature::Simd);
+            .enable_feature(wasm_opt::Feature::BulkMemory)
+            .enable_feature(wasm_opt::Feature::Simd);
 
     opt_options
         .add_pass(wasm_opt::Pass::Asyncify)
-        .set_pass_arg("asyncify-imports", "wasi_snapshot_preview1.sched_yield")
-        .add_pass(wasm_opt::Pass::StripDwarf);
+        .set_pass_arg("asyncify-imports", "wasi_snapshot_preview1.sched_yield");
 
     opt_options
 }

@@ -1,6 +1,9 @@
 # Changelog
 ## 0.X.0
 
+## 0.2.1
+- Support `--debug` in `cargo protologic build`. This uses debug build for rust and removes most `wasm_opt` optimizations, but makes things slow.
+
 ## 0.2.0
 - Much more noisy! Now there are messages telling you what's happening. Maybe too many?
 - Now tells you the before/after size from running `wasm_opt`. Has nice-ish formatting!
